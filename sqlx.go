@@ -6,12 +6,13 @@ import (
 	"errors"
 	"fmt"
 
+	"bytes"
 	"io/ioutil"
 	"path/filepath"
 	"reflect"
 	"strings"
 
-	"github.com/jmoiron/sqlx/reflectx"
+	"github.com/emptyhua/sqlx/reflectx"
 )
 
 // Although the NameMapper is convenient, in practice it should not
@@ -308,6 +309,10 @@ func (db *DB) Get(dest interface{}, query string, args ...interface{}) error {
 	return Get(db, dest, query, args...)
 }
 
+func (db *DB) InsertStruct(obj interface{}) (sql.Result, error) {
+	return InsertStruct(db, obj)
+}
+
 // MustBegin starts a transaction, and panics on error.  Returns an *sqlx.Tx instead
 // of an *sql.Tx.
 func (db *DB) MustBegin() *Tx {
@@ -399,6 +404,10 @@ func (tx *Tx) NamedExec(query string, arg interface{}) (sql.Result, error) {
 // Select within a transaction.
 func (tx *Tx) Select(dest interface{}, query string, args ...interface{}) error {
 	return Select(tx, dest, query, args...)
+}
+
+func (tx *Tx) InsertStruct(obj interface{}) (sql.Result, error) {
+	return InsertStruct(tx, obj)
 }
 
 // Queryx within a transaction.
@@ -530,6 +539,10 @@ func (q *qStmt) Exec(query string, args ...interface{}) (sql.Result, error) {
 	return q.Stmt.Exec(args...)
 }
 
+func (q *qStmt) InsertStruct(obj interface{}) (sql.Result, error) {
+	return InsertStruct(q, obj)
+}
+
 // Rows is a wrapper around sql.Rows which caches costly reflect operations
 // during a looped StructScan
 type Rows struct {
@@ -642,6 +655,76 @@ func Select(q Queryer, dest interface{}, query string, args ...interface{}) erro
 func Get(q Queryer, dest interface{}, query string, args ...interface{}) error {
 	r := q.QueryRowx(query, args...)
 	return r.scanAny(dest, false)
+}
+
+type TableNameGetter interface {
+	GetTableName() string
+}
+
+func InsertStruct(e Execer, obj interface{}) (sql.Result, error) {
+	objValue := reflect.ValueOf(obj)
+	if objValue.Kind() != reflect.Ptr || objValue.IsNil() || objValue.Elem().Kind() != reflect.Struct {
+		return nil, errors.New("insert obj must pass a pointer to sturct")
+	}
+	objType := objValue.Elem().Type()
+
+	var sqlbuf bytes.Buffer
+	sqlbuf.WriteString("INSERT INTO `")
+	if g, ok := obj.(TableNameGetter); ok {
+		sqlbuf.WriteString(g.GetTableName())
+	} else {
+		sqlbuf.WriteString(strings.ToLower(objType.Name()))
+	}
+	sqlbuf.WriteString("` (`")
+
+	mapper := mapperFor(e)
+	typeMap := mapper.TypeMap(objType)
+	valueMap := mapper.FieldMap(objValue.Elem())
+	fieldCount := len(valueMap)
+	pkName := ""
+
+	for _, v := range typeMap.Names {
+		if _, ok := v.Options["pk"]; ok {
+			pkName = v.Name
+			fieldCount -= 1
+			break
+		}
+	}
+
+	if fieldCount == 0 {
+		return nil, errors.New("insert obj must at least have one field")
+	}
+
+	tmp1 := make([]string, 0, fieldCount)
+	tmp2 := make([]string, 0, fieldCount)
+	tmp3 := make([]interface{}, 0, fieldCount)
+
+	var pkValue reflect.Value
+
+	for k, v := range valueMap {
+		if k == pkName {
+			pkValue = v
+			continue
+		}
+		tmp1 = append(tmp1, k)
+		tmp2 = append(tmp2, "?")
+		tmp3 = append(tmp3, v.Interface())
+	}
+
+	sqlbuf.WriteString(strings.Join(tmp1, "`,`"))
+	sqlbuf.WriteString("`) VALUES (")
+	sqlbuf.WriteString(strings.Join(tmp2, ","))
+	sqlbuf.WriteString(")")
+
+	res, err := e.Exec(sqlbuf.String(), tmp3...)
+	if err == nil && pkValue.CanSet() && pkValue.Kind() == reflect.Int {
+		id, err2 := res.LastInsertId()
+		if err2 == nil {
+			pkValue.SetInt(id)
+		}
+	}
+
+	return res, err
 }
 
 // LoadFile exec's every statement in a file (as a single call to Exec).
