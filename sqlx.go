@@ -717,10 +717,15 @@ func InsertStruct(e Execer, obj interface{}) (sql.Result, error) {
 	sqlbuf.WriteString(")")
 
 	res, err := e.Exec(sqlbuf.String(), tmp3...)
-	if err == nil && pkValue.CanSet() && pkValue.Kind() == reflect.Int {
-		id, err2 := res.LastInsertId()
-		if err2 == nil {
-			pkValue.SetInt(id)
+	if err == nil && pkValue.CanSet() {
+		if id, err2 := res.LastInsertId(); err2 == nil {
+			switch pkValue.Interface().(type) {
+			case int, int8, int16, int32, int64:
+				pkValue.SetInt(id)
+			case uint, uint8, uint16, uint32, uint64:
+				pkValue.SetUint(uint64(id))
+			default:
+			}
 		}
 	}
 
